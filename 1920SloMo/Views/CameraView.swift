@@ -10,6 +10,7 @@ struct CameraView: View {
     @AppStorage("saveOriginal") private var saveOriginal = true
     @AppStorage("audioRecording") private var audioRecording = true
     @AppStorage("keepScreenAwake") private var keepScreenAwake = true
+    @AppStorage("removesFourSecondRecordingLimit") private var removesFourSecondRecordingLimit = false
 
     @State private var interpolation: InterpolationMultiplier =
         FrameInterpolationProcessor.isAppleInterpolationAvailable ? .eight : .off
@@ -107,6 +108,7 @@ struct CameraView: View {
         }
         .task {
             camera.recordAudio = audioRecording
+            camera.limitsRecordingDuration = !removesFourSecondRecordingLimit
             await camera.prepare()
             refreshCameraAuthorizationStatus()
             storageDestination.refreshAvailability()
@@ -114,6 +116,9 @@ struct CameraView: View {
         .onChange(of: camera.completedSourceURL) { _, newURL in
             guard let newURL else { return }
             beginProcessing(sourceURL: newURL)
+        }
+        .onChange(of: removesFourSecondRecordingLimit) { _, removesLimit in
+            camera.limitsRecordingDuration = !removesLimit
         }
         .onChange(of: camera.isRecording) { _, recording in
             UIApplication.shared.isIdleTimerDisabled = recording && keepScreenAwake
@@ -463,6 +468,9 @@ private struct ProcessingOverlay: View {
                 .progressViewStyle(.linear)
             Text("Creating slow motion…")
                 .font(.headline)
+            Text("Please do not lock your iPhone while processing.")
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
             Text(progress, format: .percent.precision(.fractionLength(0)))
                 .font(.title2.monospacedDigit())
             Button("Cancel", role: .cancel, action: cancel)

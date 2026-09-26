@@ -107,7 +107,7 @@ enum CameraError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .cameraUnavailable: "No rear camera is available."
-        case .permissionDenied: "Camera or microphone access is denied."
+        case .permissionDenied: "Camera, Microphone, or Photos access is denied. Check permissions in Settings."
         case .unsupportedFrameRate: "That real capture frame rate is not supported by this lens."
         case .unsupportedExposure: "That shutter speed is not supported by the active camera format."
         case .configurationFailed(let detail): "Camera configuration failed: \(detail)"

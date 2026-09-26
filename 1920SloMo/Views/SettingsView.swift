@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage("saveOriginal") private var saveOriginal = true
     @AppStorage("audioRecording") private var audioRecording = true
     @AppStorage("keepScreenAwake") private var keepScreenAwake = true
+    @AppStorage("removesFourSecondRecordingLimit") private var removesFourSecondRecordingLimit = false
     @AppStorage("defaultPlaybackFPS") private var playbackFPS = 30
     @AppStorage("defaultAspectRatio") private var aspectRatio = CaptureAspectRatio.standard.rawValue
     @AppStorage("interpolationQuality") private var quality = InterpolationQuality.quality.rawValue
@@ -43,6 +44,12 @@ struct SettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                         Toggle("Keep Screen Awake While Recording", isOn: $keepScreenAwake)
+                        Toggle("Remove 4-Second Recording Limit", isOn: $removesFourSecondRecordingLimit)
+                        if removesFourSecondRecordingLimit {
+                            Text("Long recordings consume a lot of storage, can make your iPhone hot, and may be difficult to process on older iPhone models.")
+                                .font(.footnote)
+                                .foregroundStyle(.orange)
+                        }
                         Picker("Playback FPS", selection: $playbackFPS) {
                             Text("30").tag(30)
                             Text("60").tag(60)

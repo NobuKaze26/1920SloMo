@@ -34,6 +34,7 @@ final class CameraManager {
     var manualISO = false
     var requestedISO: Float = 100
     var recordAudio = true
+    var limitsRecordingDuration = true
     var resolutionLabel = "—"
     var capabilityReport = "Camera not configured"
     var adjustableAperture = false
@@ -48,7 +49,7 @@ final class CameraManager {
                 guard let self else { return }
                 self.isRecording = false
                 self.timerTask?.cancel()
-                if let error {
+                if let error, !Self.isMaximumDurationReached(error) {
                     self.errorMessage = CameraError.recordingFailed(error.localizedDescription).localizedDescription
                 } else if self.isSuspended {
                     try? FileManager.default.removeItem(at: url)
@@ -286,6 +287,9 @@ final class CameraManager {
         completedSourceURL = nil
         elapsed = 0
         updateOrientation()
+        movieOutput.maxRecordedDuration = limitsRecordingDuration
+            ? CMTime(seconds: 4, preferredTimescale: 600)
+            : .invalid
         movieOutput.startRecording(to: url, recordingDelegate: delegateProxy)
         isRecording = true
         timerTask = Task { [weak self] in
@@ -306,6 +310,12 @@ final class CameraManager {
     func consumeCompletedURL() -> URL? {
         defer { completedSourceURL = nil }
         return completedSourceURL
+    }
+
+    private static func isMaximumDurationReached(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == AVFoundationErrorDomain
+            && nsError.code == AVError.Code.maximumDurationReached.rawValue
     }
 
     private func requestCameraAccess() async -> Bool {
