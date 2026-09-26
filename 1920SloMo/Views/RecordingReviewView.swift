@@ -14,25 +14,28 @@ struct RecordingReviewView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 18) {
-                VideoPlayer(player: player)
-                    .aspectRatio(result.displayAspectRatio, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
-                VStack(spacing: 6) {
-                    Text("REAL CAPTURE")
-                        .font(.caption.weight(.semibold))
+            ZStack {
+                ResponsiveAppBackground()
+                VStack(spacing: 18) {
+                    VideoPlayer(player: player)
+                        .aspectRatio(result.displayAspectRatio, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 18))
+                    VStack(spacing: 6) {
+                        Text("REAL CAPTURE")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text("\(result.capturedFPS) FPS")
+                            .font(.title2.bold())
+                        Text("Slow motion: \(result.equivalentFPS / result.playbackFPS)× at \(result.playbackFPS) FPS playback")
+                            .font(.subheadline)
+                    }
+                    Text("Saved to \(result.saveDestinationName)")
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    Text("\(result.capturedFPS) FPS")
-                        .font(.title2.bold())
-                    Text("Slow motion: \(result.equivalentFPS / result.playbackFPS)× at \(result.playbackFPS) FPS playback")
-                        .font(.subheadline)
+                    Spacer()
                 }
-                Text("Saved to Photos")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
+                .padding()
             }
-            .padding()
             .navigationTitle("Recording")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

@@ -89,6 +89,7 @@ struct RecordingResult: Identifiable {
     let equivalentFPS: Int
     let playbackFPS: Int
     let displayAspectRatio: Double
+    let saveDestinationName: String
 }
 
 enum CameraError: LocalizedError {

@@ -15,6 +15,7 @@ final class CameraManager {
 
     private(set) var previewDevice: AVCaptureDevice?
     @ObservationIgnored private var timerTask: Task<Void, Never>?
+    @ObservationIgnored private var isSuspended = false
 
     private(set) var lenses: [LensOption] = []
     private(set) var formats: [CameraFormatOption] = []
@@ -28,7 +29,7 @@ final class CameraManager {
     private(set) var thermalState = ProcessInfo.processInfo.thermalState
 
     var selectedLensID = ""
-    var selectedFPS = 60
+    var selectedFPS = 240
     var selectedShutter: ShutterChoice = .auto
     var manualISO = false
     var requestedISO: Float = 100
@@ -49,6 +50,8 @@ final class CameraManager {
                 self.timerTask?.cancel()
                 if let error {
                     self.errorMessage = CameraError.recordingFailed(error.localizedDescription).localizedDescription
+                } else if self.isSuspended {
+                    try? FileManager.default.removeItem(at: url)
                 } else {
                     self.completedSourceURL = url
                 }
@@ -62,19 +65,33 @@ final class CameraManager {
             errorMessage = CameraError.permissionDenied.localizedDescription
             return
         }
+        errorMessage = nil
         if recordAudio { _ = await AVCaptureDevice.requestAccess(for: .audio) }
         discoverLenses()
-        guard let first = lenses.first else {
+        guard let widestLens = lenses.min(by: { $0.zoomFactor < $1.zoomFactor }) else {
             errorMessage = CameraError.cameraUnavailable.localizedDescription
             return
         }
-        selectedLensID = first.id
-        await configure(device: first.device, zoomFactor: first.zoomFactor)
+        selectedLensID = widestLens.id
+        await configure(device: widestLens.device, zoomFactor: widestLens.zoomFactor)
     }
 
     func selectLens(_ lens: LensOption) async {
         guard !isRecording else { return }
         selectedLensID = lens.id
+        if activeDevice?.uniqueID == lens.device.uniqueID {
+            do {
+                try lens.device.lockForConfiguration()
+                lens.device.videoZoomFactor = min(
+                    max(lens.zoomFactor, 1),
+                    lens.device.activeFormat.videoMaxZoomFactor
+                )
+                lens.device.unlockForConfiguration()
+            } catch {
+                errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
+            }
+            return
+        }
         await configure(device: lens.device, zoomFactor: lens.zoomFactor)
     }
 
@@ -103,37 +120,64 @@ final class CameraManager {
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
-            if let duration = selectedShutter.duration {
+            let iso = min(max(requestedISO, device.activeFormat.minISO), device.activeFormat.maxISO)
+
+            if manualISO {
+                if #available(iOS 26.0, *) {
+                    let duration = selectedShutter.duration ?? AVCaptureDevice.autoExposureDuration
+                    if device.activeFormat.supportsExposureModeCustom(
+                        lensAperture: AVCaptureDevice.autoLensAperture,
+                        duration: duration,
+                        iso: iso
+                    ) {
+                        await device.setExposureModeCustom(
+                            lensAperture: AVCaptureDevice.autoLensAperture,
+                            duration: duration,
+                            iso: iso
+                        )
+                    } else if device.isExposureModeSupported(.custom) {
+                        // This format cannot use an ISO-priority combination. Lock its current
+                        // shutter duration so the requested ISO still takes effect reliably.
+                        await device.setExposureModeCustom(
+                            duration: selectedShutter.duration ?? AVCaptureDevice.currentExposureDuration,
+                            iso: iso
+                        )
+                    } else {
+                        throw CameraError.configurationFailed(
+                            "The active camera format does not support manual ISO."
+                        )
+                    }
+                } else {
+                    let duration = selectedShutter.duration ?? device.exposureDuration
+                    await device.setExposureModeCustom(duration: duration, iso: iso)
+                }
+            } else if let duration = selectedShutter.duration {
                 guard duration.seconds >= device.activeFormat.minExposureDuration.seconds,
                       duration.seconds <= device.activeFormat.maxExposureDuration.seconds else {
                     throw CameraError.unsupportedExposure
-                }
-                let iso: Float
-                if manualISO {
-                    iso = min(max(requestedISO, device.activeFormat.minISO), device.activeFormat.maxISO)
-                } else {
-                    iso = min(max(device.iso, device.activeFormat.minISO), device.activeFormat.maxISO)
                 }
                 if #available(iOS 26.0, *),
                    device.activeFormat.supportsExposureModeCustom(
                     lensAperture: AVCaptureDevice.currentLensAperture,
                     duration: duration,
-                    iso: manualISO ? iso : AVCaptureDevice.autoISO
+                    iso: AVCaptureDevice.autoISO
                    ) {
                     await device.setExposureModeCustom(
                         lensAperture: AVCaptureDevice.currentLensAperture,
                         duration: duration,
-                        iso: manualISO ? iso : AVCaptureDevice.autoISO
+                        iso: AVCaptureDevice.autoISO
                     )
                 } else {
-                    await device.setExposureModeCustom(duration: duration, iso: iso)
+                    await device.setExposureModeCustom(duration: duration, iso: device.iso)
                 }
             } else if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure
             }
             currentISO = device.iso
         } catch {
-            errorMessage = CameraError.unsupportedExposure.localizedDescription
+            errorMessage = manualISO
+                ? "Manual ISO is not supported by the active camera format."
+                : CameraError.unsupportedExposure.localizedDescription
         }
     }
 
@@ -187,8 +231,41 @@ final class CameraManager {
         }
     }
 
+    func pausePreview() {
+        guard !isRecording else { return }
+        sessionQueue.async { [session] in
+            if session.isRunning {
+                session.stopRunning()
+            }
+        }
+    }
+
+    func suspend() {
+        isSuspended = true
+        timerTask?.cancel()
+        timerTask = nil
+        if movieOutput.isRecording {
+            movieOutput.stopRecording()
+        }
+        sessionQueue.async { [session] in
+            if session.isRunning {
+                session.stopRunning()
+            }
+        }
+    }
+
+    func resume() {
+        isSuspended = false
+        guard isConfigured else { return }
+        sessionQueue.async { [session] in
+            if !session.isRunning {
+                session.startRunning()
+            }
+        }
+    }
+
     func startRecording() async {
-        guard isConfigured, !isRecording else { return }
+        guard isConfigured, !isRecording, !isSuspended else { return }
         thermalState = ProcessInfo.processInfo.thermalState
         guard thermalState != .critical else {
             errorMessage = "The iPhone is too hot to begin another recording."
@@ -253,13 +330,18 @@ final class CameraManager {
             return
         }
         let ultraWideCamera = discoveredDevices.first(where: { $0.deviceType == .builtInUltraWideCamera })
-        rebuildZoomOptions(wideCamera: wideCamera, ultraWideCamera: ultraWideCamera, maxZoom: wideCamera.activeFormat.videoMaxZoomFactor)
+        let telephotoCamera = discoveredDevices.first(where: { $0.deviceType == .builtInTelephotoCamera })
+        rebuildZoomOptions(
+            wideCamera: wideCamera,
+            ultraWideCamera: ultraWideCamera,
+            telephotoCamera: telephotoCamera
+        )
     }
 
     private func rebuildZoomOptions(
         wideCamera: AVCaptureDevice,
         ultraWideCamera: AVCaptureDevice?,
-        maxZoom: CGFloat
+        telephotoCamera: AVCaptureDevice?
     ) {
         var options: [LensOption] = []
         if let ultraWideCamera {
@@ -274,8 +356,7 @@ final class CameraManager {
             )
         }
 
-        let supportedMaxZoom = ultraWideCamera == nil ? min(maxZoom, 2) : maxZoom
-        for zoom in [1, 2, 4, 8] where supportedMaxZoom >= CGFloat(zoom) {
+        for zoom in [1, 2] where wideCamera.activeFormat.videoMaxZoomFactor >= CGFloat(zoom) {
             options.append(
                 LensOption(
                     id: "\(wideCamera.uniqueID)-\(zoom)",
@@ -285,6 +366,28 @@ final class CameraManager {
                     zoomFactor: CGFloat(zoom)
                 )
             )
+        }
+        if let telephotoCamera {
+            options.append(
+                LensOption(
+                    id: "\(telephotoCamera.uniqueID)-4",
+                    name: "4×",
+                    deviceType: telephotoCamera.deviceType,
+                    device: telephotoCamera,
+                    zoomFactor: 1
+                )
+            )
+            if telephotoCamera.activeFormat.videoMaxZoomFactor >= 2 {
+                options.append(
+                    LensOption(
+                        id: "\(telephotoCamera.uniqueID)-8",
+                        name: "8×",
+                        deviceType: telephotoCamera.deviceType,
+                        device: telephotoCamera,
+                        zoomFactor: 2
+                    )
+                )
+            }
         }
         lenses = options
     }
@@ -296,24 +399,35 @@ final class CameraManager {
             return
         }
 
-        session.stopRunning()
         session.beginConfiguration()
         session.sessionPreset = .inputPriority
-        for input in session.inputs { session.removeInput(input) }
-        for output in session.outputs { session.removeOutput(output) }
+        let previousVideoInput = session.inputs
+            .compactMap { $0 as? AVCaptureDeviceInput }
+            .first(where: { $0.device.hasMediaType(.video) })
+        if let previousVideoInput {
+            session.removeInput(previousVideoInput)
+        }
         do {
             let videoInput = try AVCaptureDeviceInput(device: device)
-            guard session.canAddInput(videoInput), session.canAddOutput(movieOutput) else {
-                throw CameraError.configurationFailed("Unable to attach camera input or movie output.")
+            guard session.canAddInput(videoInput) else {
+                if let previousVideoInput, session.canAddInput(previousVideoInput) {
+                    session.addInput(previousVideoInput)
+                }
+                throw CameraError.configurationFailed("Unable to attach camera input.")
             }
             session.addInput(videoInput)
-            if recordAudio,
+            if session.outputs.isEmpty {
+                guard session.canAddOutput(movieOutput) else {
+                    throw CameraError.configurationFailed("Unable to attach movie output.")
+                }
+                session.addOutput(movieOutput)
+            }
+            if session.inputs.count == 1, recordAudio,
                let microphone = AVCaptureDevice.default(for: .audio),
                let audioInput = try? AVCaptureDeviceInput(device: microphone),
                session.canAddInput(audioInput) {
                 session.addInput(audioInput)
             }
-            session.addOutput(movieOutput)
             session.commitConfiguration()
             activeDevice = device
             previewDevice = device
@@ -335,7 +449,7 @@ final class CameraManager {
             rebuildZoomOptions(
                 wideCamera: discoveredDevices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? device,
                 ultraWideCamera: discoveredDevices.first(where: { $0.deviceType == .builtInUltraWideCamera }),
-                maxZoom: device.activeFormat.videoMaxZoomFactor
+                telephotoCamera: discoveredDevices.first(where: { $0.deviceType == .builtInTelephotoCamera })
             )
             inspectAperture(device)
             updateCapabilityReport(device: device, option: best)
@@ -355,9 +469,16 @@ final class CameraManager {
         if #available(iOS 26.0, *) {
             let format = device.activeFormat
             let stops = format.recommendedLensApertureStops
-            adjustableAperture = !stops.isEmpty && format.minLensAperture != format.maxLensAperture
+            let lensSupportsApertureControl = device.deviceType == .builtInWideAngleCamera
+            adjustableAperture = lensSupportsApertureControl
+                && !stops.isEmpty
+                && format.minLensAperture != format.maxLensAperture
             apertureStops = stops
-            selectedAperture = adjustableAperture ? device.lensAperture : nil
+            selectedAperture = adjustableAperture
+                ? stops.min(by: {
+                    abs($0 - device.lensAperture) < abs($1 - device.lensAperture)
+                })
+                : nil
         }
     }
 

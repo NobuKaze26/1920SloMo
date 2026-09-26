@@ -23,6 +23,15 @@ final class WatchRecordingRemote: NSObject, WCSessionDelegate {
     }
 
 
+    func resume() {
+        guard WCSession.isSupported() else { return }
+        requestPhoneStatus()
+    }
+
+    func suspend() {
+        disconnect()
+    }
+
     func toggleRecording() {
         guard isConnected, isPhoneReady else { return }
         session.sendMessage(
@@ -139,6 +148,7 @@ final class WatchRecordingRemote: NSObject, WCSessionDelegate {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var remote = WatchRecordingRemote()
 
     var body: some View {
@@ -163,6 +173,16 @@ struct ContentView: View {
             .disabled(!remote.isConnected || !remote.isPhoneReady)
         }
         .padding()
+        .onAppear {
+            remote.resume()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                remote.resume()
+            } else if phase == .background {
+                remote.suspend()
+            }
+        }
     }
 
     private var connectionLabel: String {

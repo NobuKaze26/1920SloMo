@@ -1,6 +1,7 @@
 import AVFoundation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct CameraView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -10,9 +11,10 @@ struct CameraView: View {
     @AppStorage("audioRecording") private var audioRecording = true
     @AppStorage("keepScreenAwake") private var keepScreenAwake = true
 
-    @State private var interpolation: InterpolationMultiplier = .off
+    @State private var interpolation: InterpolationMultiplier =
+        FrameInterpolationProcessor.isAppleInterpolationAvailable ? .eight : .off
     @State private var playbackFPS: PlaybackFPS = .thirty
-    @State private var aspectRatio: CaptureAspectRatio = .widescreen
+    @State private var aspectRatio: CaptureAspectRatio = .standard
     @State private var quality: InterpolationQuality = .quality
     @State private var controlsExpanded = false
     @State private var showingSettings = false
@@ -21,13 +23,16 @@ struct CameraView: View {
     @State private var processingTask: Task<Void, Never>?
     @State private var result: RecordingResult?
     @State private var showingReview = false
+    @State private var showingStoragePicker = false
+    @State private var storageDestination = StorageDestinationManager()
     @State private var alertMessage: String?
+    @State private var cameraAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
 
     private let interpolationAvailable = FrameInterpolationProcessor.isAppleInterpolationAvailable
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            ResponsiveAppBackground()
             GeometryReader { proxy in
                 CameraPreview(session: camera.session, device: camera.previewDevice) { point in
                     camera.focus(at: point)
@@ -38,12 +43,18 @@ struct CameraView: View {
             }
             .ignoresSafeArea()
 
+            if cameraAuthorizationStatus != .authorized {
+                CameraPermissionMessage()
+            }
+
             VStack(spacing: 12) {
                 CameraHeader(
                     resolution: camera.resolutionLabel,
                     realFPS: camera.selectedFPS,
                     equivalentFPS: equivalentFPS,
-                    settings: { showingSettings = true }
+                    externalDriveAvailable: storageDestination.isExternalDriveAvailable,
+                    settings: { showingSettings = true },
+                    chooseStorage: showStoragePicker
                 )
                 Spacer()
                 if camera.isRecording {
@@ -90,10 +101,15 @@ struct CameraView: View {
                     cancel: { processingTask?.cancel() }
                 )
             }
+            if showingStoragePicker {
+                StorageOpeningOverlay()
+            }
         }
         .task {
             camera.recordAudio = audioRecording
             await camera.prepare()
+            refreshCameraAuthorizationStatus()
+            storageDestination.refreshAvailability()
         }
         .onChange(of: camera.completedSourceURL) { _, newURL in
             guard let newURL else { return }
@@ -103,8 +119,54 @@ struct CameraView: View {
             UIApplication.shared.isIdleTimerDisabled = recording && keepScreenAwake
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active && camera.isRecording {
-                camera.stopRecording()
+            switch phase {
+            case .active:
+                // A Files picker can be interrupted by a storage disconnect without
+                // delivering its completion handler. Clear its presentation state here.
+                showingStoragePicker = false
+                refreshCameraAuthorizationStatus()
+                if cameraAuthorizationStatus == .authorized && !camera.isConfigured {
+                    Task { await camera.prepare() }
+                } else {
+                    camera.resume()
+                }
+                storageDestination.refreshAvailability()
+            case .background:
+                processingTask?.cancel()
+                camera.suspend()
+                storageDestination.suspend()
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
+        .onChange(of: storageDestination.statusMessage) { _, message in
+            if let message {
+                alertMessage = message
+                storageDestination.clearStatusMessage()
+            }
+        }
+        .onChange(of: showingStoragePicker) { _, isPresented in
+            if isPresented {
+                camera.pausePreview()
+            } else if scenePhase == .active {
+                camera.resume()
+            }
+        }
+        .fileImporter(
+            isPresented: $showingStoragePicker,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { selection in
+            showingStoragePicker = false
+            switch selection {
+            case .success(let urls):
+                if let url = urls.first {
+                    storageDestination.selectDestination(url)
+                }
+            case .failure(let error):
+                alertMessage = "Could not choose external storage: \(error.localizedDescription)"
             }
         }
         .sheet(isPresented: $showingSettings) {
@@ -126,13 +188,31 @@ struct CameraView: View {
             set: { if !$0 { alertMessage = nil } }
         )) {
             Button("OK") { alertMessage = nil }
-            Button("Open Settings") {
-                UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
+            if camera.errorMessage != nil {
+                Button("Open Settings") {
+                    UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
+                }
             }
         } message: {
             Text(alertMessage ?? camera.errorMessage ?? "")
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func refreshCameraAuthorizationStatus() {
+        cameraAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
+    }
+
+    private func showStoragePicker() {
+        if showingStoragePicker {
+            showingStoragePicker = false
+            Task { @MainActor in
+                await Task.yield()
+                showingStoragePicker = true
+            }
+        } else {
+            showingStoragePicker = true
+        }
     }
 
     private var equivalentFPS: Int {
@@ -172,16 +252,22 @@ struct CameraView: View {
                     Task { @MainActor in processingProgress = progress }
                 }
                 let displayAspectRatio = try await displayAspectRatio(of: sourceURL)
+                let equivalent = captured * chosenInterpolation
+                let saveDestinationName = try await storageDestination.saveVideos(
+                    processedURL: outputURL,
+                    originalURL: saveOriginal ? sourceURL : nil,
+                    capturedFPS: captured,
+                    equivalentFPS: equivalent
+                )
                 let completed = RecordingResult(
                     originalURL: sourceURL,
                     processedURL: outputURL,
                     capturedFPS: captured,
-                    equivalentFPS: captured * chosenInterpolation,
+                    equivalentFPS: equivalent,
                     playbackFPS: playbackFPS.rawValue,
-                    displayAspectRatio: displayAspectRatio
+                    displayAspectRatio: displayAspectRatio,
+                    saveDestinationName: saveDestinationName
                 )
-                try await PhotoLibraryManager.saveVideo(at: outputURL)
-                if saveOriginal { try await PhotoLibraryManager.saveVideo(at: sourceURL) }
                 result = completed
                 showingReview = true
             } catch is CancellationError {
@@ -205,11 +291,31 @@ struct CameraView: View {
     }
 }
 
+private struct CameraPermissionMessage: View {
+    var body: some View {
+        Label {
+            Text("Camera access is required to preview and record video.")
+                .font(.headline)
+                .multilineTextAlignment(.center)
+        } icon: {
+            Image(systemName: "camera.fill")
+        }
+        .foregroundStyle(.white)
+        .padding(20)
+        .frame(maxWidth: 320)
+        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 18))
+        .accessibilityElement(children: .combine)
+        .allowsHitTesting(false)
+    }
+}
+
 private struct CameraHeader: View {
     let resolution: String
     let realFPS: Int
     let equivalentFPS: Int
+    let externalDriveAvailable: Bool
     let settings: () -> Void
+    let chooseStorage: () -> Void
 
     var body: some View {
         HStack {
@@ -235,10 +341,24 @@ private struct CameraHeader: View {
             .padding(.vertical, 8)
             .glassEffect(.regular, in: Capsule())
             Spacer()
-            Image(systemName: "externaldrive.fill")
+            Button(action: chooseStorage) {
+                ZStack {
+                    Image(systemName: "externaldrive.fill")
+                    if !externalDriveAvailable {
+                        Capsule()
+                            .fill(.white)
+                            .frame(width: 34, height: 3)
+                            .rotationEffect(.degrees(-45))
+                    }
+                }
                 .frame(width: 42, height: 42)
-                .glassEffect(.regular, in: Circle())
-                .accessibilityLabel("Storage checked before recording")
+            }
+            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel(
+                externalDriveAvailable
+                    ? "External storage selected. Choose another storage folder."
+                    : "External storage unavailable. Choose a storage folder."
+            )
         }
         .foregroundStyle(.white)
     }
@@ -316,6 +436,20 @@ private struct CaptureFooter: View {
             }
         }
         .foregroundStyle(.white)
+    }
+}
+
+private struct StorageOpeningOverlay: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+            Text("Opening external storage…")
+                .font(.headline)
+        }
+        .padding(24)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28))
+        .foregroundStyle(.white)
+        .allowsHitTesting(false)
     }
 }
 

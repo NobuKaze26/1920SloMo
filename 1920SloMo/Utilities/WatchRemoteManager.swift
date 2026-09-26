@@ -35,7 +35,7 @@ final class WatchRemoteManager: NSObject, WCSessionDelegate {
         let state = currentState()
         try? session.updateApplicationContext(state)
         guard session.isReachable else { return }
-        session.sendMessage(state, replyHandler: nil)
+        session.sendMessage(state, replyHandler: nil, errorHandler: { _ in })
     }
 
     private func currentState() -> [String: Any] {

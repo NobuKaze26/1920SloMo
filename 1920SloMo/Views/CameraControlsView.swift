@@ -66,31 +66,43 @@ struct CameraControlsView: View {
             }
             Toggle("Manual ISO", isOn: $camera.manualISO)
                 .font(.caption)
-            if camera.adjustableAperture {
-                HStack {
-                    Label("Aperture", systemImage: "camera.aperture")
-                        .font(.caption)
-                    Spacer()
-                    Picker(
-                        "Aperture",
-                        selection: Binding(
-                            get: { camera.selectedAperture },
-                            set: { value in Task { await camera.setAperture(value) } }
-                        )
-                    ) {
-                        Text("Auto").tag(Float?.none)
-                        ForEach(camera.apertureStops, id: \.self) { stop in
-                            Text("f/\(stop.formatted())").tag(Float?.some(stop))
+                .onChange(of: camera.manualISO) { _, _ in
+                    Task { await camera.applyExposure() }
+                }
+            HStack {
+                Label("Aperture", systemImage: "camera.aperture")
+                    .font(.caption)
+                Spacer()
+                Menu {
+                    Button("Auto") {
+                        Task { await camera.setAperture(nil) }
+                    }
+                    ForEach(camera.apertureStops, id: \.self) { stop in
+                        Button("f/\(stop.formatted())") {
+                            Task { await camera.setAperture(stop) }
                         }
                     }
-                    .labelsHidden()
+                } label: {
+                    Text(apertureLabel)
+                        .font(.caption.weight(.semibold))
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Aperture")
+                .disabled(!camera.adjustableAperture)
             }
+            .opacity(camera.adjustableAperture ? 1 : 0.55)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                camera.adjustableAperture
+                    ? "Aperture"
+                    : "Aperture is fixed for the active lens and format"
+            )
         }
         .padding(14)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24))
+    }
+
+    private var apertureLabel: String {
+        guard let aperture = camera.selectedAperture else { return "Auto" }
+        return "f/\(aperture.formatted())"
     }
 
     private func controlMenu<Content: View>(
