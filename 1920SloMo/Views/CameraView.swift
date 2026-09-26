@@ -120,8 +120,14 @@ struct CameraView: View {
         .onChange(of: removesFourSecondRecordingLimit) { _, removesLimit in
             camera.limitsRecordingDuration = !removesLimit
         }
-        .onChange(of: camera.isRecording) { _, recording in
-            UIApplication.shared.isIdleTimerDisabled = recording && keepScreenAwake
+        .onChange(of: camera.isRecording) { _, _ in
+            updateIdleTimer()
+        }
+        .onChange(of: isProcessing) { _, _ in
+            updateIdleTimer()
+        }
+        .onChange(of: keepScreenAwake) { _, _ in
+            updateIdleTimer()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -202,6 +208,11 @@ struct CameraView: View {
             Text(alertMessage ?? camera.errorMessage ?? "")
         }
         .preferredColorScheme(.dark)
+    }
+
+    private func updateIdleTimer() {
+        UIApplication.shared.isIdleTimerDisabled = keepScreenAwake
+            && (camera.isRecording || isProcessing)
     }
 
     private func refreshCameraAuthorizationStatus() {

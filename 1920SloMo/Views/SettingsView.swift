@@ -43,7 +43,7 @@ struct SettingsView: View {
                         Text("The interpolated slow-motion video is silent.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
-                        Toggle("Keep Screen Awake While Recording", isOn: $keepScreenAwake)
+                        Toggle("Keep Screen Awake While Recording and Processing", isOn: $keepScreenAwake)
                         Toggle("Remove 4-Second Recording Limit", isOn: $removesFourSecondRecordingLimit)
                         if removesFourSecondRecordingLimit {
                             Text("Long recordings consume a lot of storage, can make your iPhone hot, and may be difficult to process on older iPhone models.")
