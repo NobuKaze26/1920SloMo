@@ -28,14 +28,28 @@ enum FormatSelection {
         return options.max { score($0) < score($1) }
     }
 
-    static func supportedShutters(for format: AVCaptureDevice.Format, at fps: Int) -> [ShutterChoice] {
-        let minimum = format.minExposureDuration.seconds
-        let maximum = min(format.maxExposureDuration.seconds, 1 / Double(fps))
-        let values = [240, 500, 1000, 2000, 4000, 8000]
-        return [.auto] + values.compactMap { value in
-            let seconds = 1 / Double(value)
-            return (seconds >= minimum && seconds <= maximum) ? .denominator(value) : nil
-        }
+    static func shutterRange(for format: AVCaptureDevice.Format, at fps: Int) -> ShutterDurationRange? {
+        let fastest = format.minExposureDuration.seconds
+        let slowest = min(format.maxExposureDuration.seconds, 1 / Double(fps))
+        guard fastest.isFinite, slowest.isFinite, fastest > 0, fastest <= slowest else { return nil }
+        return ShutterDurationRange(fastest: fastest, slowest: slowest)
+    }
+
+    static let shutterChoices: [ShutterChoice] = [
+        .auto,
+        .denominator(240),
+        .denominator(500),
+        .denominator(1_000),
+        .denominator(2_000),
+        .denominator(4_000),
+        .denominator(8_000)
+    ]
+
+    static func isSupported(_ shutter: ShutterChoice, in range: ShutterDurationRange?) -> Bool {
+        guard let duration = shutter.duration?.seconds else { return true }
+        guard let range else { return false }
+        let tolerance = max(duration * 0.000_1, 0.000_000_001)
+        return duration >= range.fastest - tolerance && duration <= range.slowest + tolerance
     }
 
     private static func score(_ option: CameraFormatOption) -> Int {

@@ -15,24 +15,41 @@ final class CameraManager {
 
     private(set) var previewDevice: AVCaptureDevice?
     @ObservationIgnored private var timerTask: Task<Void, Never>?
+    @ObservationIgnored private var focusTask: Task<Void, Never>?
+    @ObservationIgnored private var exposureTask: Task<Bool, Never>?
+    @ObservationIgnored private var lastShutterCapabilitySignature = ""
     @ObservationIgnored private var isSuspended = false
+    @ObservationIgnored private var pendingCaptureMetadata: CameraMetadataSnapshot?
+    @ObservationIgnored private var activeFormatOption: CameraFormatOption?
+    @ObservationIgnored private var requestedAspectRatio: CaptureAspectRatio = .widescreen
+    @ObservationIgnored private var recordingStabilizationObservation: NSKeyValueObservation?
+    @ObservationIgnored private var recordingStabilizationTask: Task<Void, Never>?
+    @ObservationIgnored private var recordingRotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    @ObservationIgnored private var recordingRotationDeviceID: String?
+    /// Set from the view on foldable displays only; conventional iPhones keep the original behavior.
+    @ObservationIgnored var isFoldableDisplay = false
+    @ObservationIgnored private var interruptionTask: Task<Void, Never>?
 
     private(set) var lenses: [LensOption] = []
     private(set) var formats: [CameraFormatOption] = []
     private(set) var shutters: [ShutterChoice] = [.auto]
+    private(set) var shutterRange: ShutterDurationRange?
     private(set) var isConfigured = false
     private(set) var isRecording = false
+    private(set) var isStartingRecording = false
     private(set) var elapsed: TimeInterval = 0
     private(set) var currentISO: Float = 0
+    private(set) var isTorchAvailable = false
+    private(set) var isTorchOn = false
     private(set) var errorMessage: String?
     private(set) var completedSourceURL: URL?
+    private(set) var completedCaptureMetadata: CameraMetadataSnapshot?
     private(set) var thermalState = ProcessInfo.processInfo.thermalState
+    private(set) var stabilizationRevision = 0
 
     var selectedLensID = ""
     var selectedFPS = 240
     var selectedShutter: ShutterChoice = .auto
-    var manualISO = false
-    var requestedISO: Float = 100
     var recordAudio = true
     var limitsRecordingDuration = true
     var resolutionLabel = "—"
@@ -40,6 +57,8 @@ final class CameraManager {
     var adjustableAperture = false
     var apertureStops: [Float] = []
     var selectedAperture: Float?
+    private var previewStabilizationStatus = "Initializing"
+    private var recordingStabilizationStatus = "Initializing"
 
     private let logger = Logger(subsystem: "ExtremeSloMo", category: "Camera")
 
@@ -49,18 +68,28 @@ final class CameraManager {
                 guard let self else { return }
                 self.isRecording = false
                 self.timerTask?.cancel()
+                self.timerTask = nil
                 if let error, !Self.isMaximumDurationReached(error) {
+                    self.logger.error("Recording finished with error: \(error.localizedDescription, privacy: .public)")
                     self.errorMessage = CameraError.recordingFailed(error.localizedDescription).localizedDescription
+                    self.completedCaptureMetadata = nil
                 } else if self.isSuspended {
                     try? FileManager.default.removeItem(at: url)
+                    self.completedCaptureMetadata = nil
                 } else {
+                    self.logger.info("Recording finished successfully: \(url.lastPathComponent, privacy: .public)")
                     self.completedSourceURL = url
+                    self.completedCaptureMetadata = self.pendingCaptureMetadata
+                    Task { await self.logRecordedFrameRate(at: url) }
                 }
+                self.pendingCaptureMetadata = nil
             }
         }
     }
 
     func prepare() async {
+        logger.info("Camera diagnostics v2 ready.")
+        observeSessionInterruptions()
         let cameraGranted = await requestCameraAccess()
         guard cameraGranted else {
             errorMessage = CameraError.permissionDenied.localizedDescription
@@ -88,6 +117,7 @@ final class CameraManager {
                     lens.device.activeFormat.videoMaxZoomFactor
                 )
                 lens.device.unlockForConfiguration()
+                reevaluateStabilization()
             } catch {
                 errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
             }
@@ -97,64 +127,64 @@ final class CameraManager {
     }
 
     func selectFPS(_ fps: Int) async {
+        guard !isRecording else { return }
         guard let option = formats.first(where: { $0.fps == fps }), let device = activeDevice else { return }
         do {
             try device.lockForConfiguration()
+            let previousZoom = device.videoZoomFactor
             device.activeFormat = option.format
             let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
+            applyDynamicAspectRatio(to: device)
+            if isFoldableDisplay {
+                // Changing the format resets zoom to 1x, which silently switched the selected lens.
+                device.videoZoomFactor = min(max(previousZoom, 1), device.activeFormat.videoMaxZoomFactor)
+            }
             device.unlockForConfiguration()
+            lockInputFrameDurationIfSupported(duration, for: device)
             selectedFPS = fps
             resolutionLabel = option.resolutionLabel
-            shutters = FormatSelection.supportedShutters(for: option.format, at: fps)
-            if !shutters.contains(selectedShutter) { selectedShutter = .auto }
-            updateCapabilityReport(device: device, option: option)
+            activeFormatOption = option
+            refreshShutterCapabilities(for: device)
+            reevaluateStabilization()
             await applyExposure()
         } catch {
             errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
         }
     }
 
-    func applyExposure() async {
-        guard let device = activeDevice else { return }
+    func setCaptureAspectRatio(_ aspectRatio: CaptureAspectRatio) {
+        requestedAspectRatio = aspectRatio
+        guard !isRecording, let device = activeDevice else { return }
         do {
             try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            let iso = min(max(requestedISO, device.activeFormat.minISO), device.activeFormat.maxISO)
+            applyDynamicAspectRatio(to: device)
+            device.unlockForConfiguration()
+            reevaluateStabilization()
+        } catch {
+            errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
+        }
+    }
 
-            if manualISO {
-                if #available(iOS 26.0, *) {
-                    let duration = selectedShutter.duration ?? AVCaptureDevice.autoExposureDuration
-                    if device.activeFormat.supportsExposureModeCustom(
-                        lensAperture: AVCaptureDevice.autoLensAperture,
-                        duration: duration,
-                        iso: iso
-                    ) {
-                        await device.setExposureModeCustom(
-                            lensAperture: AVCaptureDevice.autoLensAperture,
-                            duration: duration,
-                            iso: iso
-                        )
-                    } else if device.isExposureModeSupported(.custom) {
-                        // This format cannot use an ISO-priority combination. Lock its current
-                        // shutter duration so the requested ISO still takes effect reliably.
-                        await device.setExposureModeCustom(
-                            duration: selectedShutter.duration ?? AVCaptureDevice.currentExposureDuration,
-                            iso: iso
-                        )
-                    } else {
-                        throw CameraError.configurationFailed(
-                            "The active camera format does not support manual ISO."
-                        )
-                    }
-                } else {
-                    let duration = selectedShutter.duration ?? device.exposureDuration
-                    await device.setExposureModeCustom(duration: duration, iso: iso)
-                }
-            } else if let duration = selectedShutter.duration {
-                guard duration.seconds >= device.activeFormat.minExposureDuration.seconds,
-                      duration.seconds <= device.activeFormat.maxExposureDuration.seconds else {
+    @discardableResult
+    func applyExposure() async -> Bool {
+        exposureTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            return await self.applyExposureConfiguration()
+        }
+        exposureTask = task
+        return await task.value
+    }
+
+    private func applyExposureConfiguration() async -> Bool {
+        guard let device = activeDevice else { return false }
+        refreshShutterCapabilities(for: device)
+        logger.info("Applying exposure: shutter=\(self.selectedShutter.label, privacy: .public), ISO=auto")
+        do {
+            if let duration = selectedShutter.duration {
+                guard isShutterSupported(selectedShutter) else {
                     throw CameraError.unsupportedExposure
                 }
                 if #available(iOS 26.0, *),
@@ -163,72 +193,232 @@ final class CameraManager {
                     duration: duration,
                     iso: AVCaptureDevice.autoISO
                    ) {
-                    await device.setExposureModeCustom(
+                    try await setCustomExposure(
+                        on: device,
                         lensAperture: AVCaptureDevice.currentLensAperture,
                         duration: duration,
                         iso: AVCaptureDevice.autoISO
                     )
                 } else {
-                    await device.setExposureModeCustom(duration: duration, iso: device.iso)
+                    try await setCustomExposure(on: device, duration: duration, iso: device.iso)
                 }
-            } else if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
+            } else {
+                if #available(iOS 26.0, *), let selectedAperture,
+                   device.activeFormat.supportsExposureModeCustom(
+                    lensAperture: selectedAperture,
+                    duration: AVCaptureDevice.autoExposureDuration,
+                    iso: AVCaptureDevice.autoISO
+                   ) {
+                    try await setCustomExposure(
+                        on: device,
+                        lensAperture: selectedAperture,
+                        duration: AVCaptureDevice.autoExposureDuration,
+                        iso: AVCaptureDevice.autoISO
+                    )
+                } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                    try device.lockForConfiguration()
+                    device.exposureMode = .continuousAutoExposure
+                    device.unlockForConfiguration()
+                }
             }
             currentISO = device.iso
+            let appliedDuration = device.exposureDuration.seconds
+            let appliedDurationDescription = appliedDuration.isFinite
+                ? "\(appliedDuration)"
+                : "pending auto exposure"
+            let isoControlDescription: String
+            if #available(iOS 26.0, *) {
+                isoControlDescription = device.automaticallyAdjustsISO ? "auto" : "locked"
+            } else {
+                isoControlDescription = "auto requested"
+            }
+            logger.info(
+                "Exposure applied: mode=\(String(describing: device.exposureMode), privacy: .public), duration=\(appliedDurationDescription, privacy: .public), ISO=\(device.iso, privacy: .public), ISO control=\(isoControlDescription, privacy: .public)"
+            )
+            reevaluateStabilization()
+            return true
         } catch {
-            errorMessage = manualISO
-                ? "Manual ISO is not supported by the active camera format."
-                : CameraError.unsupportedExposure.localizedDescription
+            logger.error("Exposure application failed: \(error.localizedDescription, privacy: .public)")
+            errorMessage = CameraError.unsupportedExposure.localizedDescription
+            return false
         }
     }
 
-    func setISO(_ value: Float) async {
-        requestedISO = value
-        manualISO = true
+    private func setCustomExposure(
+        on device: AVCaptureDevice,
+        duration: CMTime,
+        iso: Float
+    ) async throws {
+        try device.lockForConfiguration()
+        device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
+        device.unlockForConfiguration()
+        await waitForExposure(on: device, requestedDuration: duration)
+    }
+
+    @available(iOS 26.0, *)
+    private func setCustomExposure(
+        on device: AVCaptureDevice,
+        lensAperture: Float,
+        duration: CMTime,
+        iso: Float
+    ) async throws {
+        try device.lockForConfiguration()
+        device.setExposureModeCustom(
+            lensAperture: lensAperture,
+            duration: duration,
+            iso: iso,
+            completionHandler: nil
+        )
+        device.unlockForConfiguration()
+        await waitForExposure(on: device, requestedDuration: duration)
+    }
+
+    private func waitForExposure(on device: AVCaptureDevice, requestedDuration: CMTime) async {
+        guard requestedDuration != AVCaptureDevice.autoExposureDuration,
+              requestedDuration != AVCaptureDevice.currentExposureDuration else { return }
+
+        for _ in 0..<100 {
+            guard !Task.isCancelled else { return }
+            let actual = device.exposureDuration.seconds
+            let tolerance = exposureDurationTolerance(for: requestedDuration.seconds)
+            if device.exposureMode == .custom,
+               actual.isFinite,
+               abs(actual - requestedDuration.seconds) <= tolerance {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func setShutterDuration(_ seconds: Double) async {
+        guard let shutter = shutters.first(where: {
+            guard let duration = $0.duration?.seconds else { return false }
+            return abs(duration - seconds) < 0.000_000_001 && isShutterSupported($0)
+        }) else { return }
+        selectedShutter = shutter
         await applyExposure()
+    }
+
+    func setAutomaticExposure() async {
+        selectedShutter = .auto
+        await applyExposure()
+    }
+
+    func isShutterSupported(_ shutter: ShutterChoice) -> Bool {
+        FormatSelection.isSupported(shutter, in: shutterRange)
+    }
+
+    private func refreshShutterCapabilities(for device: AVCaptureDevice) {
+        let range = FormatSelection.shutterRange(for: device.activeFormat, at: selectedFPS)
+        shutterRange = range
+        shutters = FormatSelection.shutterChoices
+        logShutterCapabilities(for: device, range: range)
+        guard range != nil, case .denominator = selectedShutter,
+              let seconds = selectedShutter.duration?.seconds else { return }
+        let supportedChoices = shutters.filter { isShutterSupported($0) && $0.duration != nil }
+        selectedShutter = supportedChoices.min {
+            guard let lhs = $0.duration?.seconds, let rhs = $1.duration?.seconds else { return false }
+            return abs(log(lhs / seconds)) < abs(log(rhs / seconds))
+        } ?? .auto
+    }
+
+    private func logShutterCapabilities(for device: AVCaptureDevice, range: ShutterDurationRange?) {
+        let supportedLabels = shutters.filter(isShutterSupported).map(\.label).joined(separator: ", ")
+        let signature = "\(device.uniqueID)|\(selectedFPS)|\(range?.fastest ?? 0)|\(range?.slowest ?? 0)"
+        guard signature != lastShutterCapabilitySignature else { return }
+        lastShutterCapabilitySignature = signature
+        logger.info(
+            "Shutter capabilities: camera=\(device.localizedName, privacy: .public), fps=\(self.selectedFPS), fastest=\(range?.fastest ?? 0, privacy: .public)s, slowest=\(range?.slowest ?? 0, privacy: .public)s, enabled=\(supportedLabels, privacy: .public)"
+        )
     }
 
     func setAperture(_ value: Float?) async {
         guard #available(iOS 26.0, *), let device = activeDevice else { return }
+        if selectedAperture == nil, value == nil { return }
+        if let selectedAperture, let value, abs(selectedAperture - value) < 0.001 { return }
+
         let aperture = value ?? AVCaptureDevice.autoLensAperture
+        let duration = selectedShutter.duration ?? AVCaptureDevice.autoExposureDuration
+        let iso = AVCaptureDevice.autoISO
         let format = device.activeFormat
         guard format.supportsExposureModeCustom(
             lensAperture: aperture,
-            duration: AVCaptureDevice.autoExposureDuration,
-            iso: AVCaptureDevice.autoISO
+            duration: duration,
+            iso: iso
         ) else {
             errorMessage = CameraError.unsupportedExposure.localizedDescription
             return
         }
         do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            await device.setExposureModeCustom(
+            try await setCustomExposure(
+                on: device,
                 lensAperture: aperture,
-                duration: AVCaptureDevice.autoExposureDuration,
-                iso: AVCaptureDevice.autoISO
+                duration: duration,
+                iso: iso
             )
             selectedAperture = value
+            reevaluateStabilization()
         } catch {
             errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
         }
     }
 
     func focus(at point: CGPoint) {
-        guard let device = activeDevice else { return }
+        focusTask?.cancel()
+        focusTask = Task { [weak self] in
+            guard let self, let device = self.activeDevice else { return }
+            let preservesManualExposure = self.selectedShutter.duration != nil
+            self.logger.info(
+                "Focus requested: shutter=\(self.selectedShutter.label, privacy: .public), torch=\(self.isTorchOn), preservesManualExposure=\(preservesManualExposure)"
+            )
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                if device.isFocusPointOfInterestSupported,
+                   device.isFocusModeSupported(.autoFocus) {
+                    device.focusPointOfInterest = point
+                    device.focusMode = .autoFocus
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+                    if !preservesManualExposure,
+                       device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                }
+            } catch {
+                self.logger.error("Focus configuration failed: \(error.localizedDescription)")
+                return
+            }
+
+            for _ in 0..<100 where device.isAdjustingFocus && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            guard !Task.isCancelled else { return }
+            await self.applyExposure()
+            self.logger.info(
+                "Focus finished: shutter=\(self.selectedShutter.label, privacy: .public), duration=\(device.exposureDuration.seconds, privacy: .public)s"
+            )
+        }
+    }
+
+    func setTorchEnabled(_ enabled: Bool) async {
+        guard let device = activeDevice,
+              device.hasTorch,
+              device.isTorchModeSupported(enabled ? .on : .off) else {
+            isTorchAvailable = false
+            isTorchOn = false
+            return
+        }
         do {
             try device.lockForConfiguration()
-            if device.isFocusPointOfInterestSupported {
-                device.focusPointOfInterest = point
-                device.focusMode = .autoFocus
-            }
-            if device.isExposurePointOfInterestSupported {
-                device.exposurePointOfInterest = point
-                device.exposureMode = .continuousAutoExposure
-            }
+            device.torchMode = enabled ? .on : .off
             device.unlockForConfiguration()
+            isTorchAvailable = true
+            isTorchOn = enabled
+            await applyExposure()
         } catch {
-            logger.error("Focus configuration failed: \(error.localizedDescription)")
+            errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
         }
     }
 
@@ -263,10 +453,20 @@ final class CameraManager {
                 session.startRunning()
             }
         }
+        reevaluateStabilization()
     }
 
     func startRecording() async {
-        guard isConfigured, !isRecording, !isSuspended else { return }
+        logger.info("Recording requested.")
+        guard isConfigured, !isStartingRecording, !isRecording, !movieOutput.isRecording, !isSuspended else {
+            logger.error(
+                "Recording start rejected: configured=\(self.isConfigured), starting=\(self.isStartingRecording), stateRecording=\(self.isRecording), outputRecording=\(self.movieOutput.isRecording), suspended=\(self.isSuspended)"
+            )
+            return
+        }
+        isStartingRecording = true
+        defer { isStartingRecording = false }
+        errorMessage = nil
         thermalState = ProcessInfo.processInfo.thermalState
         guard thermalState != .critical else {
             errorMessage = "The iPhone is too hot to begin another recording."
@@ -283,14 +483,27 @@ final class CameraManager {
         }
 
         let url = FileManager.default.temporaryDirectory
-            .appending(path: "capture-\(UUID().uuidString).mov")
+            .appending(path: "1920slomo-\(UUID().uuidString).mov")
         completedSourceURL = nil
+        completedCaptureMetadata = nil
         elapsed = 0
+        if let focusTask {
+            await focusTask.value
+        }
+        if !isRequestedExposureApplied {
+            guard await applyExposure() else {
+                logger.error("Recording start rejected because exposure could not be restored.")
+                return
+            }
+        }
+
         updateOrientation()
+        pendingCaptureMetadata = captureMetadataSnapshot()
         movieOutput.maxRecordedDuration = limitsRecordingDuration
             ? CMTime(seconds: 4, preferredTimescale: 600)
             : .invalid
         movieOutput.startRecording(to: url, recordingDelegate: delegateProxy)
+        logger.info("Recording started at \(url.lastPathComponent, privacy: .public)")
         isRecording = true
         timerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -307,9 +520,63 @@ final class CameraManager {
         movieOutput.stopRecording()
     }
 
+    private var isRequestedExposureApplied: Bool {
+        guard let device = activeDevice else { return false }
+        guard let requestedDuration = selectedShutter.duration else {
+            return device.exposureMode == .continuousAutoExposure
+        }
+        guard device.exposureMode == .custom else { return false }
+        let tolerance = exposureDurationTolerance(for: requestedDuration.seconds)
+        return abs(device.exposureDuration.seconds - requestedDuration.seconds) <= tolerance
+    }
+
+    private func exposureDurationTolerance(for requestedSeconds: Double) -> Double {
+        // Camera hardware represents very short exposures in discrete increments. At
+        // 1/8000, the nearest duration can differ by several microseconds even after
+        // AVFoundation has successfully applied the request.
+        max(requestedSeconds * 0.02, 0.000_010)
+    }
+
     func consumeCompletedURL() -> URL? {
         defer { completedSourceURL = nil }
         return completedSourceURL
+    }
+
+    func consumeCompletedCaptureMetadata() -> CameraMetadataSnapshot? {
+        defer { completedCaptureMetadata = nil }
+        return completedCaptureMetadata
+    }
+
+    private func captureMetadataSnapshot() -> CameraMetadataSnapshot? {
+        guard let device = activeDevice else { return nil }
+        let exposureDuration = device.exposureDuration.seconds
+        let aperture = Double(device.lensAperture)
+        let iso = Double(device.iso)
+        let temperature = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature
+        logger.info(
+            "Recording metadata snapshot: camera=\(device.localizedName, privacy: .public), aperture=\(aperture, privacy: .public), shutter=\(exposureDuration, privacy: .public)s, ISO=\(iso, privacy: .public), WB=\(temperature, privacy: .public)K"
+        )
+        return CameraMetadataSnapshot(
+            manufacturer: "Apple",
+            // AVFoundation doesn't expose the retail iPhone name. Internal machine
+            // identifiers such as "iPhone19,3" aren't suitable camera-model metadata.
+            deviceModel: nil,
+            cameraIdentifier: Self.cameraIdentifier(for: device.deviceType),
+            lensModel: device.localizedName,
+            aperture: aperture.isFinite && aperture > 0 ? aperture : nil,
+            exposureDuration: exposureDuration.isFinite && exposureDuration > 0 ? exposureDuration : nil,
+            iso: iso.isFinite && iso > 0 ? iso : nil,
+            whiteBalanceTemperature: temperature.isFinite && temperature > 0 ? Double(temperature) : nil
+        )
+    }
+
+    private static func cameraIdentifier(for type: AVCaptureDevice.DeviceType) -> String {
+        switch type {
+        case .builtInUltraWideCamera: "Ultra Wide"
+        case .builtInWideAngleCamera: "Wide"
+        case .builtInTelephotoCamera: "Telephoto"
+        default: type.rawValue
+        }
     }
 
     private static func isMaximumDurationReached(_ error: Error) -> Bool {
@@ -441,6 +708,8 @@ final class CameraManager {
             session.commitConfiguration()
             activeDevice = device
             previewDevice = device
+            isTorchAvailable = device.hasTorch && device.isTorchModeSupported(.on)
+            if !isTorchAvailable { isTorchOn = false }
             formats = options
             isConfigured = true
             try device.lockForConfiguration()
@@ -448,28 +717,45 @@ final class CameraManager {
             let duration = CMTime(value: 1, timescale: CMTimeScale(best.fps))
             device.activeVideoMinFrameDuration = duration
             device.activeVideoMaxFrameDuration = duration
+            applyDynamicAspectRatio(to: device)
             device.videoZoomFactor = min(max(zoomFactor, 1), device.activeFormat.videoMaxZoomFactor)
             if device.isFocusModeSupported(.continuousAutoFocus) {
                 device.focusMode = .continuousAutoFocus
             }
             device.unlockForConfiguration()
+            lockInputFrameDurationIfSupported(duration, for: device)
             selectedFPS = best.fps
             resolutionLabel = best.resolutionLabel
-            shutters = FormatSelection.supportedShutters(for: best.format, at: best.fps)
+            activeFormatOption = best
+            refreshShutterCapabilities(for: device)
             rebuildZoomOptions(
                 wideCamera: discoveredDevices.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? device,
                 ultraWideCamera: discoveredDevices.first(where: { $0.deviceType == .builtInUltraWideCamera }),
                 telephotoCamera: discoveredDevices.first(where: { $0.deviceType == .builtInTelephotoCamera })
             )
             inspectAperture(device)
-            updateCapabilityReport(device: device, option: best)
+            reevaluateStabilization()
             sessionQueue.async { [session] in
                 if !session.isRunning { session.startRunning() }
             }
+            if isTorchOn {
+                await setTorchEnabled(true)
+            }
+            await applyExposure()
         } catch {
             session.commitConfiguration()
             errorMessage = CameraError.configurationFailed(error.localizedDescription).localizedDescription
         }
+    }
+
+    private func applyDynamicAspectRatio(to device: AVCaptureDevice) {
+        guard #available(iOS 26.0, *) else { return }
+        let target: AVCaptureDevice.AspectRatio = requestedAspectRatio == .standard ? .ratio4x3 : .ratio16x9
+        guard device.activeFormat.supportedDynamicAspectRatios.contains(target),
+              device.dynamicAspectRatio != target else {
+            return
+        }
+        device.setDynamicAspectRatio(target)
     }
 
     private func inspectAperture(_ device: AVCaptureDevice) {
@@ -495,13 +781,61 @@ final class CameraManager {
     private func updateOrientation() {
         guard let connection = movieOutput.connection(with: .video) else { return }
         let angle: CGFloat
-        switch UIDevice.current.orientation {
-        case .landscapeLeft: angle = 0
-        case .landscapeRight: angle = 180
-        case .portraitUpsideDown: angle = 270
-        default: angle = 90
+        if isFoldableDisplay, let device = activeDevice {
+            // Foldable displays: follow the physical orientation relative to gravity.
+            if recordingRotationDeviceID != device.uniqueID {
+                recordingRotationCoordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+                recordingRotationDeviceID = device.uniqueID
+            }
+            guard let gravityAngle = recordingRotationCoordinator?.videoRotationAngleForHorizonLevelCapture else { return }
+            angle = gravityAngle
+        } else {
+            switch UIDevice.current.orientation {
+            case .landscapeLeft: angle = 0
+            case .landscapeRight: angle = 180
+            case .portraitUpsideDown: angle = 270
+            default: angle = 90
+            }
         }
         if connection.isVideoRotationAngleSupported(angle) { connection.videoRotationAngle = angle }
+    }
+
+    /// Reports genuine session interruptions (for example another foreground app holding the
+    /// camera in a multitasking layout). The session resumes on its own when they end, and an
+    /// in-progress recording is finalized by the movie output rather than restarted here.
+    private func observeSessionInterruptions() {
+        guard interruptionTask == nil else { return }
+        interruptionTask = Task { [weak self, session] in
+            let center = NotificationCenter.default
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await note in center.notifications(named: AVCaptureSession.wasInterruptedNotification, object: session) {
+                        let reasonValue = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
+                        let reason = reasonValue.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
+                        await self?.handleInterruption(reason)
+                    }
+                }
+                group.addTask {
+                    for await _ in center.notifications(named: AVCaptureSession.interruptionEndedNotification, object: session) {
+                        await self?.handleInterruptionEnded()
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleInterruption(_ reason: AVCaptureSession.InterruptionReason?) {
+        logger.info("Capture session interrupted: \(reason.map { String(describing: $0) } ?? "unknown", privacy: .public)")
+        if reason == .videoDeviceNotAvailableWithMultipleForegroundApps {
+            errorMessage = "The camera isn't available while another app is open beside 1920SloMo. Use 1920SloMo full screen to record."
+        }
+    }
+
+    private func handleInterruptionEnded() {
+        logger.info("Capture session interruption ended.")
+        if errorMessage?.hasPrefix("The camera isn't available while another app") == true {
+            errorMessage = nil
+        }
     }
 
     private func updateCapabilityReport(device: AVCaptureDevice, option: CameraFormatOption) {
@@ -517,9 +851,154 @@ final class CameraManager {
         ISO: \(option.format.minISO.formatted())–\(option.format.maxISO.formatted())
         Lens aperture: f/\(device.lensAperture.formatted())
         Adjustable aperture: \(adjustableAperture ? "Yes" : "No")
+        Preview stabilization: \(previewStabilizationStatus)
+        Recording stabilization: \(recordingStabilizationStatus)
         Available lenses: \(lenses.map(\.name).joined(separator: ", "))
         Codec: HEVC where supported
         """
+    }
+
+    func updatePreviewStabilizationStatus(_ status: String) {
+        guard previewStabilizationStatus != status else { return }
+        previewStabilizationStatus = status
+        refreshCapabilityReport()
+    }
+
+    func reevaluateStabilization() {
+        stabilizationRevision &+= 1
+        configureRecordingStabilization()
+        refreshCapabilityReport()
+    }
+
+    private func configureRecordingStabilization() {
+        recordingStabilizationTask?.cancel()
+        recordingStabilizationObservation = nil
+        guard let device = activeDevice,
+              let connection = movieOutput.connection(with: .video) else {
+            recordingStabilizationStatus = isConfigured ? "Unavailable" : "Initializing"
+            return
+        }
+        guard connection.isVideoStabilizationSupported else {
+            connection.preferredVideoStabilizationMode = .off
+            recordingStabilizationStatus = "Unavailable"
+            return
+        }
+
+        let candidates: [AVCaptureVideoStabilizationMode] = selectedFPS > 60
+            ? [.lowLatency, .standard]
+            : [.standard, .lowLatency]
+        let supportedModes = candidates.filter(device.activeFormat.isVideoStabilizationModeSupported)
+        guard !supportedModes.isEmpty else {
+            connection.preferredVideoStabilizationMode = .off
+            recordingStabilizationStatus = "Unavailable"
+            return
+        }
+
+        connection.preferredVideoStabilizationMode = supportedModes[0]
+        recordingStabilizationStatus = connection.activeVideoStabilizationMode == .off && !session.isRunning
+            ? "Initializing"
+            : Self.stabilizationStatus(
+                activeMode: connection.activeVideoStabilizationMode,
+                isSupported: true
+            )
+        recordingStabilizationObservation = connection.observe(
+            \.activeVideoStabilizationMode,
+            options: [.new]
+        ) { [weak self] connection, _ in
+            let status = Self.stabilizationStatus(
+                activeMode: connection.activeVideoStabilizationMode,
+                isSupported: true
+            )
+            Task { @MainActor [weak self] in
+                guard let self, self.recordingStabilizationStatus != status else { return }
+                self.recordingStabilizationStatus = status
+                self.refreshCapabilityReport()
+            }
+        }
+        recordingStabilizationTask = Task { @MainActor [weak self, weak connection] in
+            guard let self, let connection else { return }
+            for mode in supportedModes {
+                guard !Task.isCancelled else { return }
+                connection.preferredVideoStabilizationMode = mode
+                try? await Task.sleep(for: .milliseconds(180))
+                guard !Task.isCancelled else { return }
+                if connection.activeVideoStabilizationMode != .off {
+                    break
+                }
+            }
+            self.recordingStabilizationStatus = Self.stabilizationStatus(
+                activeMode: connection.activeVideoStabilizationMode,
+                isSupported: true
+            )
+            self.refreshCapabilityReport()
+            self.logger.info(
+                "Recording stabilization requested=\(Self.stabilizationModeName(connection.preferredVideoStabilizationMode), privacy: .public), active=\(Self.stabilizationModeName(connection.activeVideoStabilizationMode), privacy: .public)"
+            )
+        }
+    }
+
+    private func refreshCapabilityReport() {
+        guard let device = activeDevice, let option = activeFormatOption else { return }
+        updateCapabilityReport(device: device, option: option)
+    }
+
+    private func lockInputFrameDurationIfSupported(
+        _ duration: CMTime,
+        for device: AVCaptureDevice
+    ) {
+        guard #available(iOS 26.0, *),
+              let input = session.inputs
+                .compactMap({ $0 as? AVCaptureDeviceInput })
+                .first(where: { $0.device.uniqueID == device.uniqueID }),
+              input.isLockedVideoFrameDurationSupported,
+              device.minSupportedLockedVideoFrameDuration.isValid,
+              CMTimeCompare(duration, device.minSupportedLockedVideoFrameDuration) >= 0 else {
+            return
+        }
+        input.activeLockedVideoFrameDuration = duration
+        logger.info(
+            "Locked input frame rate: requested=\(1 / duration.seconds, privacy: .public) FPS, active=\(1 / input.activeLockedVideoFrameDuration.seconds, privacy: .public) FPS"
+        )
+    }
+
+    private func logRecordedFrameRate(at url: URL) async {
+        do {
+            let asset = AVURLAsset(url: url)
+            guard let track = try await asset.loadTracks(withMediaType: .video).first else { return }
+            let nominalFrameRate = try await track.load(.nominalFrameRate)
+            let minimumFrameDuration = try await track.load(.minFrameDuration)
+            let minimumFrameRate = minimumFrameDuration.seconds > 0
+                ? 1 / minimumFrameDuration.seconds
+                : 0
+            logger.info(
+                "Recorded frame rate: selected=\(self.selectedFPS) FPS, nominal=\(nominalFrameRate, privacy: .public) FPS, minimum-frame-rate=\(minimumFrameRate, privacy: .public) FPS"
+            )
+        } catch {
+            logger.error("Unable to inspect recorded frame rate: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    nonisolated private static func stabilizationStatus(
+        activeMode: AVCaptureVideoStabilizationMode,
+        isSupported: Bool
+    ) -> String {
+        guard isSupported else { return "Unavailable" }
+        guard activeMode != .off else { return "Off" }
+        return "Active (\(stabilizationModeName(activeMode)))"
+    }
+
+    nonisolated private static func stabilizationModeName(_ mode: AVCaptureVideoStabilizationMode) -> String {
+        switch mode {
+        case .off: "Off"
+        case .standard: "Standard"
+        case .cinematic: "Cinematic"
+        case .cinematicExtended: "Cinematic Extended"
+        case .auto: "Automatic"
+        case .lowLatency: "Low Latency"
+        case .previewOptimized: "Preview Optimized"
+        case .cinematicExtendedEnhanced: "Cinematic Extended Enhanced"
+        @unknown default: "Unknown"
+        }
     }
 }
 

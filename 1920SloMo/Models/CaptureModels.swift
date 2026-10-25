@@ -42,8 +42,8 @@ enum ShutterChoice: Identifiable, Hashable {
     var id: String { label }
     var label: String {
         switch self {
-        case .auto: "Auto"
-        case .denominator(let value): "1/\(value)"
+        case .auto: return "Auto"
+        case .denominator(let value): return "1/\(value)"
         }
     }
     var duration: CMTime? {
@@ -51,6 +51,18 @@ enum ShutterChoice: Identifiable, Hashable {
         case .auto: nil
         case .denominator(let value): CMTime(value: 1, timescale: CMTimeScale(value))
         }
+    }
+}
+
+struct ShutterDurationRange: Equatable {
+    let fastest: Double
+    let slowest: Double
+
+    var fastestDenominator: Double { 1 / fastest }
+    var slowestDenominator: Double { 1 / slowest }
+
+    func clamped(_ seconds: Double) -> Double {
+        min(max(seconds, fastest), slowest)
     }
 }
 
@@ -90,6 +102,29 @@ struct RecordingResult: Identifiable {
     let playbackFPS: Int
     let displayAspectRatio: Double
     let saveDestinationName: String
+}
+
+struct CameraMetadataSnapshot: Sendable {
+    let manufacturer: String?
+    let deviceModel: String?
+    let cameraIdentifier: String?
+    let lensModel: String?
+    let aperture: Double?
+    let exposureDuration: Double?
+    let iso: Double?
+    let whiteBalanceTemperature: Double?
+}
+
+struct VideoMetadataContext: Sendable {
+    let nativeCaptureFPS: Int
+    let interpolationMultiplier: Int
+    let outputFPS: Int
+    let processingMode: String
+    let interpolationMethod: String
+    let camera: CameraMetadataSnapshot?
+
+    var equivalentFPS: Int { nativeCaptureFPS * interpolationMultiplier }
+    var slowMotionFactor: Double { Double(equivalentFPS) / Double(outputFPS) }
 }
 
 enum CameraError: LocalizedError {

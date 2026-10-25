@@ -2,15 +2,17 @@ import AVFoundation
 import SwiftUI
 
 struct CameraControlsView: View {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Bindable var camera: CameraManager
     @Binding var interpolation: InterpolationMultiplier
     @Binding var playbackFPS: PlaybackFPS
     @Binding var aspectRatio: CaptureAspectRatio
     @Binding var quality: InterpolationQuality
     let interpolationAvailable: Bool
+    let interpolationUnavailableTapped: () -> Void
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: isCompactHeight ? 8 : 14) {
             HStack {
                 controlMenu("Real FPS", value: "\(camera.selectedFPS)") {
                     ForEach(camera.formats) { option in
@@ -19,11 +21,20 @@ struct CameraControlsView: View {
                         }
                     }
                 }
-                controlMenu("Interpolation", value: interpolation.label) {
-                    ForEach(InterpolationMultiplier.allCases) { item in
-                        Button(item.label) { interpolation = item }
-                            .disabled(item != .off && !interpolationAvailable)
+                if interpolationAvailable {
+                    controlMenu("Interpolation", value: interpolation.label) {
+                        ForEach(InterpolationMultiplier.allCases) { item in
+                            Button(item.label) { interpolation = item }
+                        }
                     }
+                } else {
+                    Button(action: interpolationUnavailableTapped) {
+                        controlLabel("Interpolation", value: InterpolationMultiplier.off.label)
+                    }
+                    .buttonStyle(.plain)
+                    .opacity(0.55)
+                    .accessibilityLabel("Interpolation unavailable")
+                    .accessibilityValue(InterpolationMultiplier.off.label)
                 }
                 controlMenu("Playback", value: "\(playbackFPS.rawValue)") {
                     ForEach(PlaybackFPS.allCases) { item in
@@ -35,9 +46,15 @@ struct CameraControlsView: View {
                 controlMenu("Shutter", value: camera.selectedShutter.label) {
                     ForEach(camera.shutters) { shutter in
                         Button(shutter.label) {
-                            camera.selectedShutter = shutter
-                            Task { await camera.applyExposure() }
+                            Task {
+                                if let seconds = shutter.duration?.seconds {
+                                    await camera.setShutterDuration(seconds)
+                                } else {
+                                    await camera.setAutomaticExposure()
+                                }
+                            }
                         }
+                        .disabled(!camera.isShutterSupported(shutter))
                     }
                 }
                 controlMenu("Ratio", value: aspectRatio.rawValue) {
@@ -51,24 +68,23 @@ struct CameraControlsView: View {
                     }
                 }
             }
-            if camera.manualISO, let format = camera.formats.first(where: { $0.fps == camera.selectedFPS })?.format {
-                VStack(alignment: .leading) {
-                    Text("ISO \(Int(camera.requestedISO))")
-                        .font(.caption)
-                    Slider(
-                        value: Binding(
-                            get: { Double(camera.requestedISO) },
-                            set: { value in Task { await camera.setISO(Float(value)) } }
-                        ),
-                        in: Double(format.minISO)...Double(format.maxISO)
-                    )
-                }
-            }
-            Toggle("Manual ISO", isOn: $camera.manualISO)
-                .font(.caption)
-                .onChange(of: camera.manualISO) { _, _ in
-                    Task { await camera.applyExposure() }
-                }
+            Toggle(
+                "Light",
+                isOn: Binding(
+                    get: { camera.isTorchOn },
+                    set: { enabled in
+                        Task { await camera.setTorchEnabled(enabled) }
+                    }
+                )
+            )
+            .font(.caption)
+            .disabled(!camera.isTorchAvailable)
+            .opacity(camera.isTorchAvailable ? 1 : 0.55)
+            .accessibilityHint(
+                camera.isTorchAvailable
+                    ? "Uses the camera torch while previewing and recording."
+                    : "The active camera does not have an available torch."
+            )
             HStack {
                 Label("Aperture", systemImage: "camera.aperture")
                     .font(.caption)
@@ -96,8 +112,12 @@ struct CameraControlsView: View {
                     : "Aperture is fixed for the active lens and format"
             )
         }
-        .padding(14)
+        .padding(isCompactHeight ? 10 : 14)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24))
+    }
+
+    private var isCompactHeight: Bool {
+        verticalSizeClass == .compact
     }
 
     private var apertureLabel: String {
@@ -111,14 +131,18 @@ struct CameraControlsView: View {
         @ViewBuilder content: () -> Content
     ) -> some View {
         Menu(content: content) {
-            VStack(spacing: 2) {
-                Text(title).font(.caption2).foregroundStyle(.secondary)
-                Text(value).font(.caption.weight(.semibold))
-            }
-            .frame(maxWidth: .infinity)
+            controlLabel(title, value: value)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
         .accessibilityValue(value)
+    }
+
+    private func controlLabel(_ title: LocalizedStringKey, value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.caption.weight(.semibold))
+        }
+        .frame(maxWidth: .infinity)
     }
 }

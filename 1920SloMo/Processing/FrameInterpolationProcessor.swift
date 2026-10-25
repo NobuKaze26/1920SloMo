@@ -10,14 +10,89 @@ import VideoToolbox
 final class FrameInterpolationProcessor: @unchecked Sendable {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let logger = Logger(subsystem: "ExtremeSloMo", category: "Processing")
+    private let outputPixelFormat = kCVPixelFormatType_32BGRA
 
 #if targetEnvironment(simulator)
     static let isAppleInterpolationAvailable = false
 #else
     static var isAppleInterpolationAvailable: Bool {
-        if #available(iOS 26.0, *) { true } else { false }
+        if #available(iOS 26.0, *) {
+            VTFrameRateConversionConfiguration.isSupported
+        } else {
+            false
+        }
     }
 #endif
+
+    /// Center-crops an original capture to the selected display ratio while preserving its timing and audio.
+    func normalizeOriginal(
+        sourceURL: URL,
+        capturedFPS: Int,
+        aspectRatio: CaptureAspectRatio
+    ) async throws -> URL {
+        guard aspectRatio == .standard else { return sourceURL }
+
+        let asset = AVURLAsset(url: sourceURL)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw CameraError.processingFailed("The source has no video track.")
+        }
+        let naturalSize = try await track.load(.naturalSize)
+        let preferredTransform = try await track.load(.preferredTransform)
+        let duration = try await asset.load(.duration)
+        let orientedBounds = CGRect(origin: .zero, size: naturalSize)
+            .applying(preferredTransform)
+            .standardized
+        let longerSide = max(orientedBounds.width, orientedBounds.height)
+        let shorterSide = min(orientedBounds.width, orientedBounds.height)
+        guard shorterSide > 0, abs(longerSide / shorterSide - 4 / 3) > 0.001 else {
+            // A supported camera format already produced native 4:3 output, so avoid another encode.
+            return sourceURL
+        }
+        let isPortrait = orientedBounds.height > orientedBounds.width
+        let outputSize = isPortrait
+            ? CGSize(width: orientedBounds.width, height: orientedBounds.width * 4 / 3)
+            : CGSize(width: orientedBounds.height * 4 / 3, height: orientedBounds.height)
+        let cropOffset = CGPoint(
+            x: max(0, (orientedBounds.width - outputSize.width) / 2),
+            y: max(0, (orientedBounds.height - outputSize.height) / 2)
+        )
+
+        let normalizedTransform = preferredTransform.concatenating(
+            CGAffineTransform(
+                translationX: -orientedBounds.minX - cropOffset.x,
+                y: -orientedBounds.minY - cropOffset.y
+            )
+        )
+        var layerConfiguration = AVVideoCompositionLayerInstruction.Configuration(assetTrack: track)
+        layerConfiguration.setTransform(normalizedTransform, at: .zero)
+        let layerInstruction = AVVideoCompositionLayerInstruction(configuration: layerConfiguration)
+        let instructionConfiguration = AVVideoCompositionInstruction.Configuration(
+            layerInstructions: [layerInstruction],
+            timeRange: CMTimeRange(start: .zero, duration: duration)
+        )
+        let instruction = AVVideoCompositionInstruction(configuration: instructionConfiguration)
+
+        var compositionConfiguration = try await AVVideoComposition.Configuration(for: asset)
+        compositionConfiguration.renderSize = CGSize(
+            width: floor(outputSize.width / 2) * 2,
+            height: floor(outputSize.height / 2) * 2
+        )
+        compositionConfiguration.frameDuration = CMTime(value: 1, timescale: CMTimeScale(capturedFPS))
+        compositionConfiguration.instructions = [instruction]
+        let composition = AVVideoComposition(configuration: compositionConfiguration)
+
+        guard let exporter = AVAssetExportSession(
+            asset: asset,
+            presetName: AVAssetExportPresetHEVCHighestQuality
+        ) else {
+            throw CameraError.processingFailed("Unable to create the original-video crop export.")
+        }
+        exporter.videoComposition = composition
+        let outputURL = FileManager.default.temporaryDirectory
+            .appending(path: "original-cropped-\(UUID().uuidString).mov")
+        try await exporter.export(to: outputURL, as: .mov)
+        return outputURL
+    }
 
     func process(
         sourceURL: URL,
@@ -46,8 +121,9 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
         let readerOutput = AVAssetReaderTrackOutput(
             track: track,
             outputSettings: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                kCVPixelBufferPixelFormatTypeKey as String: outputPixelFormat,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
             ]
         )
         readerOutput.alwaysCopiesSampleData = false
@@ -81,10 +157,11 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
             sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: outputPixelFormat,
                 kCVPixelBufferWidthKey as String: outputWidth,
                 kCVPixelBufferHeightKey as String: outputHeight,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
             ]
         )
         guard writer.canAdd(input) else {
@@ -120,7 +197,11 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
             }
             try processor.startSession(configuration: configuration)
             frameProcessor = processor
-            interpolationPool = try makePixelBufferPool(width: sourceWidth, height: outputHeight)
+            interpolationPool = try makePixelBufferPool(
+                width: sourceWidth,
+                height: outputHeight,
+                pixelFormat: outputPixelFormat
+            )
         }
         defer { frameProcessor?.endSession() }
 #endif
@@ -145,7 +226,9 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
                 guard #available(iOS 26.0, *) else { throw CameraError.interpolationUnsupported }
                 let phases = InterpolationMultiplier.phases(for: multiplier)
                 let outputBuffers = try phases.map { _ in
-                    try makePixelBuffer(from: interpolationPool)
+                    let buffer = try makePixelBuffer(from: interpolationPool)
+                    copyColorAttachments(from: source, to: buffer)
+                    return buffer
                 }
                 let sourceTime = CMSampleBufferGetPresentationTimeStamp(sample)
                 let baseTime = sourceTime.isValid ? sourceTime : CMTime(value: frameIndex - 1, timescale: CMTimeScale(capturedFPS))
@@ -179,6 +262,7 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
                 }
                 try await process(parameters, with: frameProcessor)
                 for buffer in outputBuffers {
+                    copyColorAttachments(from: source, to: buffer)
                     try await append(
                         buffer,
                         at: CMTimeMultiply(frameDuration, multiplier: Int32(frameIndex)),
@@ -227,12 +311,17 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
         }
     }
 
-    private func makePixelBufferPool(width: Int, height: Int) throws -> CVPixelBufferPool {
+    private func makePixelBufferPool(
+        width: Int,
+        height: Int,
+        pixelFormat: OSType
+    ) throws -> CVPixelBufferPool {
         let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
         ]
         var pool: CVPixelBufferPool?
         guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess,
@@ -265,27 +354,38 @@ final class FrameInterpolationProcessor: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(2))
         }
         let sourceWidth = CVPixelBufferGetWidth(source)
-        if sourceWidth == outputWidth && CVPixelBufferGetHeight(source) == outputHeight {
-            guard adaptor.append(source, withPresentationTime: time) else {
-                throw CameraError.processingFailed("The encoder rejected a source frame.")
-            }
-            return
-        }
         guard let pool = adaptor.pixelBufferPool else {
-            throw CameraError.processingFailed("No crop buffer pool is available.")
+            throw CameraError.processingFailed("No normalized output buffer pool is available.")
         }
-        var cropped: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &cropped) == kCVReturnSuccess,
-              let cropped else {
-            throw CameraError.processingFailed("Unable to allocate a crop frame.")
+        var normalized: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &normalized) == kCVReturnSuccess,
+              let normalized else {
+            throw CameraError.processingFailed("Unable to allocate a normalized output frame.")
         }
         let x = Swift.max(CGFloat.zero, (CGFloat(sourceWidth) - CGFloat(outputWidth)) / 2)
         let image = CIImage(cvPixelBuffer: source)
         let crop = image.cropped(to: CGRect(x: x, y: 0, width: CGFloat(outputWidth), height: CGFloat(outputHeight)))
             .transformed(by: CGAffineTransform(translationX: -x, y: 0))
-        ciContext.render(crop, to: cropped)
-        guard adaptor.append(cropped, withPresentationTime: time) else {
-            throw CameraError.processingFailed("The encoder rejected a cropped frame.")
+        ciContext.render(crop, to: normalized)
+        copyColorAttachments(from: source, to: normalized)
+        guard adaptor.append(normalized, withPresentationTime: time) else {
+            throw CameraError.processingFailed("The encoder rejected a normalized frame.")
+        }
+    }
+
+    private func copyColorAttachments(from source: CVPixelBuffer, to destination: CVPixelBuffer) {
+        CVBufferPropagateAttachments(source, destination)
+
+        let colorKeys: [CFString] = [
+            kCVImageBufferColorPrimariesKey,
+            kCVImageBufferTransferFunctionKey,
+            kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferChromaLocationTopFieldKey,
+            kCVImageBufferChromaLocationBottomFieldKey
+        ]
+        for key in colorKeys {
+            guard let value = CVBufferCopyAttachment(source, key, nil) else { continue }
+            CVBufferSetAttachment(destination, key, value, .shouldPropagate)
         }
     }
 }
